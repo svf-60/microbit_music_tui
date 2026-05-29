@@ -10,9 +10,17 @@ use microbit_music_tui::app::App;
 use microbit_music_tui::serial::{self, Connection};
 
 const DEFAULT_BAUD: u32 = 115_200;
-const DEFAULT_DIR: &str = "melodies";
 
 const TICK: Duration = Duration::from_millis(50);
+
+/// Default WAV directory: the OS config dir + `microbit_music`, created if absent.
+fn default_dir() -> PathBuf {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("microbit_music");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
 
 struct Args {
     dir: PathBuf,
@@ -85,7 +93,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
 }
 
 fn parse_args() -> Option<Args> {
-    let mut dir = PathBuf::from(DEFAULT_DIR);
+    let mut dir: Option<PathBuf> = None;
     let mut port = None;
     let mut baud = DEFAULT_BAUD;
 
@@ -107,7 +115,7 @@ fn parse_args() -> Option<Args> {
                 }
                 return None;
             }
-            "--dir" => dir = PathBuf::from(it.next().unwrap_or_default()),
+            "--dir" => dir = it.next().map(PathBuf::from),
             "--port" => port = it.next(),
             "--baud" => {
                 baud = it
@@ -118,7 +126,11 @@ fn parse_args() -> Option<Args> {
             other => eprintln!("ignoring unknown argument: {other}"),
         }
     }
-    Some(Args { dir, port, baud })
+    Some(Args {
+        dir: dir.unwrap_or_else(default_dir),
+        port,
+        baud,
+    })
 }
 
 fn print_help() {
@@ -128,7 +140,7 @@ fn print_help() {
          USAGE:\n    \
          microbit_music_tui [OPTIONS]\n\n\
          OPTIONS:\n    \
-         --dir <PATH>     Directory of WAV files (default: ./{DEFAULT_DIR})\n    \
+         --dir <PATH>     Directory of WAV files (default: <config dir>/microbit_music)\n    \
          --port <NAME>    Serial port (default: auto-detect)\n    \
          --baud <RATE>    Baud rate (default: {DEFAULT_BAUD})\n    \
          --list-ports     List available serial ports and exit\n    \
