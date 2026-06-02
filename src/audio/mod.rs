@@ -1,7 +1,4 @@
 //! The song library: discovering WAV files in a directory.
-//!
-//! A song is one WAV file. Cataloguing songs lives here; decoding a song into
-//! device-ready samples lives in [`stream`].
 
 pub mod playback;
 pub mod stream;
@@ -18,8 +15,6 @@ pub struct Song {
 }
 
 /// Load every WAV file in `dir`, sorted case-insensitively by name. Hidden files
-/// (leading `.`) and non-WAV files are skipped. The directory is re-read on
-/// every call, so this doubles as the manual-refresh entry point.
 pub fn load_dir(dir: &Path) -> Result<Vec<Song>> {
     let entries =
         fs::read_dir(dir).with_context(|| format!("reading song directory {}", dir.display()))?;

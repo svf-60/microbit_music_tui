@@ -5,15 +5,22 @@
 //! is a single-letter opcode; the remainder is its argument. The protocol is
 //! deliberately human-readable so it can be exercised with any serial monitor.
 //!
+//! PCM is **length-prefixed**: there is no single fixed-size raw run. Each chunk
+//! of sample bytes is announced by its own `C <len>` header, after which exactly
+//! `<len>` raw bytes follow on the wire and then the device is back in line mode.
+//! This is what keeps the two framings from colliding: the device only ever
+//! reads raw bytes for the exact count it was just told, so a command can never
+//! be mistaken for PCM (nor PCM for a command). See [`crate::app`] for how the
+//! host upholds the invariant (a `C` header is always written immediately
+//! followed by its payload, and command lines only ever between whole chunks).
+//!
 //! TUI -> micro:bit:
-//!   `H`                     handshake / ping        (expect `R`)
-//!   `S`                     stop all playback
-//!   `W <rate> <total> <chunk>`  begin a raw PCM stream: `total` 8-bit samples at
-//!                           `rate` Hz, sent in `chunk`-byte runs. After this
-//!                           line the next `total` bytes on the wire are raw PCM
-//!                           (not ASCII lines). The device returns `K` whenever
-//!                           it has room for another chunk.
-//!   `Z`                     end of the PCM stream    (expect `D` when playback ends)
+//!   `H`              handshake / ping        (expect `R`)
+//!   `S`              stop all playback
+//!   `W <rate>`       begin a PCM stream at `rate` Hz (8-bit unsigned mono)
+//!   `C <len>`        a chunk header: the next `<len>` bytes on the wire are raw
+//!                    PCM (not an ASCII line). The device returns `K` per chunk.
+//!   `Z`              end of the PCM stream    (expect `D` when playback ends)
 //!
 //! micro:bit -> TUI:
 //!   `R`            ready (on boot, and ack to `H`)
@@ -31,19 +38,24 @@ pub enum Command {
     Handshake,
     /// Stop playback immediately.
     Stop,
-    /// Begin a raw PCM stream; the raw sample bytes follow this line on the wire.
-    BeginStream { rate: u32, total: u32, chunk: u32 },
+    /// Begin a PCM stream at `rate` Hz. Sample bytes follow as `Chunk`s.
+    BeginStream { rate: u32 },
+    /// A chunk header; exactly `len` raw PCM bytes follow this line on the wire.
+    Chunk { len: u32 },
     /// Mark the end of the PCM sample bytes.
     EndStream,
 }
 
 impl Command {
-    /// Encode as a newline-terminated line ready to write to the port.
+    /// Encode as a newline-terminated line ready to write to the port. For
+    /// [`Command::Chunk`] this is only the header; the payload bytes are written
+    /// separately (see [`crate::serial::Transport::send_chunk`]).
     pub fn encode(&self) -> String {
         match self {
             Command::Handshake => "H\n".to_string(),
             Command::Stop => "S\n".to_string(),
-            Command::BeginStream { rate, total, chunk } => format!("W {rate} {total} {chunk}\n"),
+            Command::BeginStream { rate } => format!("W {rate}\n"),
+            Command::Chunk { len } => format!("C {len}\n"),
             Command::EndStream => "Z\n".to_string(),
         }
     }
@@ -101,15 +113,8 @@ mod tests {
     fn encodes_commands() {
         assert_eq!(Command::Handshake.encode(), "H\n");
         assert_eq!(Command::Stop.encode(), "S\n");
-        assert_eq!(
-            Command::BeginStream {
-                rate: 7812,
-                total: 4096,
-                chunk: 512
-            }
-            .encode(),
-            "W 7812 4096 512\n"
-        );
+        assert_eq!(Command::BeginStream { rate: 7812 }.encode(), "W 7812\n");
+        assert_eq!(Command::Chunk { len: 512 }.encode(), "C 512\n");
         assert_eq!(Command::EndStream.encode(), "Z\n");
     }
 

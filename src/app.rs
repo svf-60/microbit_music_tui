@@ -14,7 +14,7 @@ use std::sync::mpsc::TryRecvError;
 use crate::audio::playback::{self, Playback, Seek};
 use crate::audio::{self, Song};
 use crate::serial::protocol::{Command, Response};
-use crate::serial::{Connection, ConnectionState};
+use crate::serial::{ConnectionState, Transport};
 
 const LOG_CAP: usize = 200;
 
@@ -24,7 +24,7 @@ pub struct App {
     pub songs: Vec<Song>,
     pub selected: usize,
 
-    pub conn: Option<Connection>,
+    pub conn: Option<Box<dyn Transport>>,
     pub conn_state: ConnectionState,
 
     pub playback: Option<Playback>,
@@ -35,7 +35,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dir: PathBuf, conn: Option<Connection>) -> App {
+    pub fn new(dir: PathBuf, conn: Option<Box<dyn Transport>>) -> App {
         let conn_state = if conn.is_some() {
             ConnectionState::Connecting
         } else {
@@ -153,11 +153,12 @@ impl App {
             return;
         }
         self.status_msg = format!("Playing {} ({} Hz)", self.songs[idx].name, decoded.rate);
-        self.send(Command::BeginStream {
-            rate: decoded.rate,
-            total: total as u32,
-            chunk: playback::PCM_CHUNK as u32,
-        });
+        // End any in-flight stream first: the device is in command mode between
+        // chunks, so it reads this stop as a command, never as PCM.
+        if self.playback.is_some() {
+            self.send(Command::Stop);
+        }
+        self.send(Command::BeginStream { rate: decoded.rate });
         self.playback = Some(Playback {
             song_index: idx,
             samples: decoded.samples,
@@ -173,21 +174,18 @@ impl App {
     /// Restart the current song's stream from byte `pos` (seek / resume). Reuses
     /// the already-decoded samples — no re-decode.
     fn seek_to(&mut self, pos: usize) {
-        let (remaining, rate) = match self.playback.as_mut() {
+        let rate = match self.playback.as_mut() {
             Some(pb) => {
                 pb.pos = pos.min(pb.samples.len());
                 pb.in_flight = 0;
                 pb.ended = false;
                 pb.paused = false;
-                ((pb.samples.len() - pb.pos) as u32, pb.rate)
+                pb.rate
             }
             None => return,
         };
-        self.send(Command::BeginStream {
-            rate,
-            total: remaining,
-            chunk: playback::PCM_CHUNK as u32,
-        });
+        self.send(Command::Stop);
+        self.send(Command::BeginStream { rate });
         self.pump_pcm();
     }
 
@@ -275,9 +273,11 @@ impl App {
             }
             if pos >= total {
                 self.send(Command::EndStream);
+
                 if let Some(p) = self.playback.as_mut() {
                     p.ended = true;
                 }
+
                 return;
             }
             let end = (pos + playback::PCM_CHUNK).min(total);
@@ -285,7 +285,7 @@ impl App {
                 Some(p) => p.samples[pos..end].to_vec(),
                 None => return,
             };
-            if !self.send_raw(&chunk) {
+            if !self.send_chunk(&chunk) {
                 return;
             }
             if let Some(p) = self.playback.as_mut() {
@@ -295,9 +295,9 @@ impl App {
         }
     }
 
-    fn send_raw(&mut self, data: &[u8]) -> bool {
+    fn send_chunk(&mut self, data: &[u8]) -> bool {
         match self.conn.as_mut() {
-            Some(conn) => match conn.send_raw(data) {
+            Some(conn) => match conn.send_chunk(data) {
                 Ok(()) => true,
                 Err(e) => {
                     self.log_line(format!("! pcm send failed: {e}"));
@@ -321,9 +321,9 @@ impl App {
     pub fn poll_serial(&mut self) {
         let mut responses = Vec::new();
         let mut disconnected = false;
-        if let Some(conn) = self.conn.as_ref() {
+        if let Some(conn) = self.conn.as_mut() {
             loop {
-                match conn.responses.try_recv() {
+                match conn.try_recv() {
                     Ok(resp) => responses.push(resp),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {

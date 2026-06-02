@@ -37,11 +37,6 @@ def drain_uart():
         rx.extend(data)
 
 
-def flush_rx():
-    drain_uart()
-    del rx[:]
-
-
 def find_newline(buf):
     for i in range(len(buf)):
         if buf[i] == 10:
@@ -50,19 +45,28 @@ def find_newline(buf):
 
 
 def take_line():
+    # Rebind rather than `del rx[:n]`: in-place slice deletion isn't supported on
+    # the micro:bit's bytearray, but slicing to a fresh one is.
+    global rx
     nl = find_newline(rx)
     if nl < 0:
         return None
     line = bytes(rx[:nl])
-    del rx[: nl + 1]
-    return line.decode().strip()
+    rx = rx[nl + 1 :]
+    # A command line is always ASCII; if a stray byte ever slips in, drop the
+    # line rather than letting decode() raise and kill the program.
+    try:
+        return line.decode().strip()
+    except Exception:
+        return ""
 
 
 def read_exact(count):
+    global rx
     while len(rx) < count:
         drain_uart()
     out = bytes(rx[:count])
-    del rx[:count]
+    rx = rx[count:]
     return out
 
 
@@ -97,37 +101,66 @@ def update_volume():
         set_volume(level)
 
 
-def pcm_frames(total, chunk, report):
+def stream_frames(report):
+    # The stream is a series of `C <len>` chunks ending in `Z`. Between chunks
+    # we are back in line mode, so a button press just reports an event (the host
+    # then decides whether to stop/seek) and `S`/`Z` are always recognised — PCM
+    # bytes can never be mistaken for a command.
     frame = audio.AudioFrame()
-    consumed = 0
-    since_credit = 0
-    while consumed < total:
+    while True:
+        drain_uart()
         update_volume()
         event = poll_controls()
         if event:
-            report["event"] = event
-            return
-        size = FRAME_SIZE if total - consumed >= FRAME_SIZE else total - consumed
-        data = read_exact(size)
-        for i in range(size):
-            frame[i] = data[i]
-        for i in range(size, FRAME_SIZE):
-            frame[i] = SILENCE
-        consumed += size
-        since_credit += size
-        while since_credit >= chunk:
-            since_credit -= chunk
+            send(event)
+
+        line = take_line()
+        if line is None:
+            for i in range(FRAME_SIZE):
+                frame[i] = SILENCE
+            yield frame
+            continue
+
+        parts = line.split()
+        op = parts[0] if parts else ""
+        if op == "C":
+            try:
+                length = int(parts[1])
+            except (IndexError, ValueError):
+                send("E bad C")
+                continue
+            # Read the whole chunk once (rx is rebound a single time), then frame
+            # it from memory. Flow control keeps chunks buffered ahead, so this
+            # rarely blocks and audio stays fed.
+            data = read_exact(length)
+            consumed = 0
+            while consumed < length:
+                size = FRAME_SIZE if length - consumed >= FRAME_SIZE else length - consumed
+                for i in range(size):
+                    frame[i] = data[consumed + i]
+                for i in range(size, FRAME_SIZE):
+                    frame[i] = SILENCE
+                consumed += size
+                yield frame
             send("K")
-        yield frame
+        elif op == "Z":
+            report["end"] = "Z"
+            return
+        elif op == "S":
+            report["end"] = "S"
+            return
+        elif op == "H":
+            send("R")
 
 
-def stream(total, chunk):
+def stream():
     display.show(Image.MUSIC_QUAVER)
-    report = {"event": None}
-    audio.play(pcm_frames(total, chunk, report), wait=True, pin=pin1)
+    report = {"end": None}
+    audio.play(stream_frames(report), wait=True, pin=pin1)
     display.show(Image.YES)
-    flush_rx()
-    send(report["event"] or "D")
+    # `Z` means the song played out; `S` is a host-initiated stop it already knows.
+    if report["end"] == "Z":
+        send("D")
 
 
 def mark_connected():
@@ -140,8 +173,7 @@ def mark_connected():
 def dispatch(line):
     if not line:
         return
-    parts = line.split()
-    op = parts[0]
+    op = line.split()[0]
     if op == "H":
         audio.stop()
         mark_connected()
@@ -151,12 +183,7 @@ def dispatch(line):
         audio.stop()
     elif op == "W":
         mark_connected()
-        try:
-            _, total, chunk = int(parts[1]), int(parts[2]), int(parts[3])
-        except (IndexError, ValueError):
-            send("E bad W args")
-            return
-        stream(total, chunk)
+        stream()
 
 
 def main():
@@ -189,4 +216,5 @@ def main():
             last_announce = running_time()
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -41,7 +41,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let port = app
         .conn
         .as_ref()
-        .map(|c| c.port_name.clone())
+        .map(|c| c.port_name().to_string())
         .unwrap_or_else(|| "-".to_string());
 
     let top = Line::from(vec![

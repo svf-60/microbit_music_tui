@@ -6,11 +6,14 @@
 //! returns, the sender drops, and the receiver then yields
 //! `TryRecvError::Disconnected`. The app turns that into its own connection
 //! state — see [`crate::app`].
+//!
+//! The [`Transport`] trait is the seam the app talks through, so playback logic
+//! can be driven against an in-memory fake in tests without a real device.
 
 pub mod protocol;
 
 use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -45,12 +48,29 @@ impl ConnectionState {
     }
 }
 
+/// The app's view of the link to the device: write commands and framed PCM
+/// chunks, and drain decoded responses. Implemented by [`Connection`] over a
+/// real serial port, and by a fake in tests.
+pub trait Transport {
+    /// Write a single command line.
+    fn send(&mut self, cmd: &Command) -> Result<()>;
+    /// Write one PCM chunk: a `C <len>` header immediately followed by exactly
+    /// `data.len()` raw bytes. Header and payload must reach the wire together
+    /// and with nothing spliced between them — that is the framing invariant the
+    /// device relies on to tell PCM apart from commands.
+    fn send_chunk(&mut self, data: &[u8]) -> Result<()>;
+    /// Pull the next decoded response, if any.
+    fn try_recv(&mut self) -> std::result::Result<Response, TryRecvError>;
+    /// Human-readable name of the underlying port, for the UI.
+    fn port_name(&self) -> &str;
+}
+
 /// An open connection to the micro:bit: a writable handle plus a channel of
 /// decoded responses produced by the reader thread.
 pub struct Connection {
     port: Box<dyn SerialPort>,
-    pub responses: Receiver<Response>,
-    pub port_name: String,
+    responses: Receiver<Response>,
+    port_name: String,
 }
 
 impl Connection {
@@ -74,21 +94,34 @@ impl Connection {
             port_name: port_name.to_string(),
         })
     }
+}
 
-    /// Write a command to the micro:bit.
-    pub fn send(&mut self, cmd: &Command) -> Result<()> {
+impl Transport for Connection {
+    fn send(&mut self, cmd: &Command) -> Result<()> {
         self.port
             .write_all(cmd.encode().as_bytes())
             .and_then(|()| self.port.flush())
             .context("writing to serial port")
     }
 
-    /// Write raw bytes (used for PCM sample data, which is not line-framed).
-    pub fn send_raw(&mut self, data: &[u8]) -> Result<()> {
+    fn send_chunk(&mut self, data: &[u8]) -> Result<()> {
+        let header = Command::Chunk {
+            len: data.len() as u32,
+        }
+        .encode();
         self.port
-            .write_all(data)
+            .write_all(header.as_bytes())
+            .and_then(|()| self.port.write_all(data))
             .and_then(|()| self.port.flush())
-            .context("writing PCM to serial port")
+            .context("writing PCM chunk to serial port")
+    }
+
+    fn try_recv(&mut self) -> std::result::Result<Response, TryRecvError> {
+        self.responses.try_recv()
+    }
+
+    fn port_name(&self) -> &str {
+        &self.port_name
     }
 }
 
@@ -107,7 +140,9 @@ fn read_loop(mut port: Box<dyn SerialPort>, tx: Sender<Response>) {
                 pending.extend_from_slice(&buf[..n]);
                 while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=pos).collect();
+
                     let resp = Response::parse(&String::from_utf8_lossy(&line));
+
                     if tx.send(resp).is_err() {
                         return; // UI dropped the receiver; nothing left to do.
                     }

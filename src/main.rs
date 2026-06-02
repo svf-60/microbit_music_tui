@@ -53,6 +53,7 @@ fn main() -> Result<()> {
         }
     };
 
+    let conn = conn.map(|c| Box::new(c) as Box<dyn serial::Transport>);
     let mut app = App::new(args.dir, conn);
     let mut terminal =
         ratatui::try_init().context("initializing terminal (must be run in a TTY)")?;
